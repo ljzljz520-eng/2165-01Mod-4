@@ -23,6 +23,19 @@
 #define MAX_ENEMIES 128
 #define BASE_WAVES 5
 #define MAX_SUPPORTED_WAVES 30
+#define MAX_LOG_LINES 20
+
+typedef enum {
+    DAMAGE_PHYSICAL = 0,
+    DAMAGE_MAGICAL,
+    DAMAGE_TRUE
+} DamageType;
+
+typedef enum {
+    DIFFICULTY_EASY = 0,
+    DIFFICULTY_NORMAL,
+    DIFFICULTY_HARD
+} Difficulty;
 
 typedef struct {
     int x;
@@ -37,6 +50,7 @@ typedef struct {
     int damage;
     int upgrade_cost;
     bool active;
+    DamageType damage_type;
 } Tower;
 
 typedef struct {
@@ -47,6 +61,8 @@ typedef struct {
     int move_interval;
     int move_tick;
     bool alive;
+    int armor;
+    int magic_resist;
 } Enemy;
 
 typedef struct {
@@ -55,7 +71,13 @@ typedef struct {
     int spawn_interval;
     int move_interval;
     int reward;
+    int armor;
+    int magic_resist;
 } WaveConfig;
+
+typedef struct {
+    char text[128];
+} LogEntry;
 
 typedef struct {
     int hp;
@@ -66,19 +88,24 @@ typedef struct {
     int path_len;
     Tower towers[MAX_TOWERS];
     Enemy enemies[MAX_ENEMIES];
+    Difficulty difficulty;
+    LogEntry battle_log[MAX_LOG_LINES];
+    int log_head;
+    int log_count;
 } Game;
 
 static const WaveConfig BASE_WAVE_TABLE[BASE_WAVES] = {
-    {6, 8, 3, 2, 2},
-    {8, 10, 3, 2, 2},
-    {10, 12, 2, 2, 3},
-    {12, 15, 2, 1, 3},
-    {14, 18, 2, 1, 4},
+    {6, 8, 3, 2, 2, 0, 0},
+    {8, 10, 3, 2, 2, 0, 0},
+    {10, 12, 2, 2, 3, 1, 0},
+    {12, 15, 2, 1, 3, 1, 1},
+    {14, 18, 2, 1, 4, 2, 1},
 };
 
 static long g_tick_sleep_ms = 180;
 static long g_wave_clear_sleep_ms = 700;
 static bool g_no_clear = false;
+static bool g_detailed_log = true;
 
 typedef struct {
     struct termios original;
@@ -402,6 +429,60 @@ static int clamp_int(int value, int min, int max) {
     return value;
 }
 
+#define MAX_RESIST_PCT 60
+#define RESIST_PER_POINT 8
+
+static int calculate_damage(int base_damage, DamageType type, int armor, int magic_resist, int *reduced_by) {
+    if (type == DAMAGE_TRUE) {
+        *reduced_by = 0;
+        return base_damage;
+    }
+    int resist = 0;
+    if (type == DAMAGE_PHYSICAL) {
+        resist = armor;
+    } else if (type == DAMAGE_MAGICAL) {
+        resist = magic_resist;
+    }
+    if (resist < 0) resist = 0;
+    int pct = resist * RESIST_PER_POINT;
+    if (pct > MAX_RESIST_PCT) pct = MAX_RESIST_PCT;
+    int reduced = base_damage * pct / 100;
+    int actual = base_damage - reduced;
+    if (actual < 1) actual = 1;
+    *reduced_by = base_damage - actual;
+    return actual;
+}
+
+static const char *damage_type_name(DamageType type) {
+    switch (type) {
+        case DAMAGE_PHYSICAL: return "物理";
+        case DAMAGE_MAGICAL: return "法术";
+        case DAMAGE_TRUE: return "真实";
+        default: return "未知";
+    }
+}
+
+static void add_battle_log(Game *game, const char *text) {
+    if (!g_detailed_log) return;
+    int idx = game->log_head;
+    strncpy(game->battle_log[idx].text, text, sizeof(game->battle_log[idx].text) - 1);
+    game->battle_log[idx].text[sizeof(game->battle_log[idx].text) - 1] = '\0';
+    game->log_head = (game->log_head + 1) % MAX_LOG_LINES;
+    if (game->log_count < MAX_LOG_LINES) {
+        game->log_count += 1;
+    }
+}
+
+static void print_battle_log(const Game *game) {
+    if (!g_detailed_log || game->log_count == 0) return;
+    printf("\n战斗日志:\n");
+    int start = game->log_count < MAX_LOG_LINES ? 0 : game->log_head;
+    for (int i = 0; i < game->log_count; i++) {
+        int idx = (start + i) % MAX_LOG_LINES;
+        printf("  %s\n", game->battle_log[idx].text);
+    }
+}
+
 static long read_sleep_ms_env(const char *name, long default_value, long max_value) {
     const char *raw = getenv(name);
     if (raw == NULL || raw[0] == '\0') {
@@ -449,6 +530,8 @@ static WaveConfig get_wave_config(int wave) {
     if (cfg.spawn_interval < 1) cfg.spawn_interval = 1;
     cfg.reward += extra / 2;
     if (cfg.reward > 9) cfg.reward = 9;
+    cfg.armor += extra / 2;
+    cfg.magic_resist += extra / 3;
     return cfg;
 }
 
@@ -500,15 +583,33 @@ static int tower_count(const Game *game) {
     return count;
 }
 
+static Difficulty read_difficulty_from_env(void) {
+    const char *raw = getenv("TD_DIFFICULTY");
+    if (raw == NULL || raw[0] == '\0') {
+        return DIFFICULTY_NORMAL;
+    }
+    if (strcasecmp(raw, "easy") == 0 || strcmp(raw, "简单") == 0) {
+        return DIFFICULTY_EASY;
+    }
+    if (strcasecmp(raw, "hard") == 0 || strcmp(raw, "困难") == 0) {
+        return DIFFICULTY_HARD;
+    }
+    return DIFFICULTY_NORMAL;
+}
+
 static void init_game(Game *game) {
     memset(game, 0, sizeof(*game));
     game->hp = 10;
     game->gold = 20;
     game->wave = 1;
     game->max_waves = read_max_waves_from_env();
+    game->difficulty = read_difficulty_from_env();
+    game->log_head = 0;
+    game->log_count = 0;
     g_tick_sleep_ms = read_sleep_ms_env("TD_TICK_MS", 180, 5000);
     g_wave_clear_sleep_ms = read_sleep_ms_env("TD_WAVE_CLEAR_MS", 700, 10000);
     g_no_clear = getenv("TD_NO_CLEAR") != NULL;
+    g_detailed_log = (game->difficulty != DIFFICULTY_EASY);
     init_path(game);
 }
 
@@ -571,7 +672,10 @@ static void render_board(const Game *game, bool show_enemy_hp) {
     bool any = false;
     for (int i = 0; i < MAX_ENEMIES; i++) {
         if (!game->enemies[i].alive) continue;
-        printf("[生命:%d 位置:%d] ", game->enemies[i].hp, game->enemies[i].path_idx);
+        printf("[#%d 生命:%d 护甲:%d 法抗:%d 位置:%d] ",
+               i, game->enemies[i].hp,
+               game->enemies[i].armor, game->enemies[i].magic_resist,
+               game->enemies[i].path_idx);
         any = true;
     }
     if (!any) {
@@ -614,8 +718,9 @@ static bool add_tower(Game *game, int x, int y) {
         game->towers[i].range = 2;
         game->towers[i].damage = 3;
         game->towers[i].upgrade_cost = 10;
+        game->towers[i].damage_type = DAMAGE_PHYSICAL;
         game->gold -= cost;
-        printf("部署成功：(%d,%d)\n", x, y);
+        printf("部署成功：(%d,%d) [物理伤害]\n", x, y);
         return true;
     }
 
@@ -642,7 +747,12 @@ static bool upgrade_tower(Game *game, int x, int y) {
     tower->range += 1;
     tower->damage += 2;
     tower->upgrade_cost += 6;
-    printf("升级成功：(%d,%d) -> Lv.%d\n", x, y, tower->level);
+    if (tower->level == 3) {
+        tower->damage_type = DAMAGE_MAGICAL;
+        printf("升级成功：(%d,%d) -> Lv.%d [觉醒为法术伤害]\n", x, y, tower->level);
+    } else {
+        printf("升级成功：(%d,%d) -> Lv.%d [%s伤害]\n", x, y, tower->level, damage_type_name(tower->damage_type));
+    }
     return true;
 }
 
@@ -656,9 +766,18 @@ static bool spawn_enemy(Game *game, const WaveConfig *cfg) {
         game->enemies[i].reward = cfg->reward;
         game->enemies[i].move_interval = cfg->move_interval;
         game->enemies[i].move_tick = 0;
+        game->enemies[i].armor = cfg->armor;
+        game->enemies[i].magic_resist = cfg->magic_resist;
         return true;
     }
     return false;
+}
+
+static int find_enemy_index(const Game *game, const Enemy *enemy) {
+    for (int i = 0; i < MAX_ENEMIES; i++) {
+        if (&game->enemies[i] == enemy) return i;
+    }
+    return -1;
 }
 
 static void towers_attack(Game *game) {
@@ -682,10 +801,42 @@ static void towers_attack(Game *game) {
         }
 
         if (target == NULL) continue;
-        target->hp -= tower->damage;
+
+        int reduced = 0;
+        int actual_damage = calculate_damage(tower->damage, tower->damage_type,
+                                             target->armor, target->magic_resist, &reduced);
+
+        target->hp -= actual_damage;
+
+        if (g_detailed_log) {
+            int tower_idx = i;
+            int enemy_idx = find_enemy_index(game, target);
+            char log_buf[128];
+            const char *type_name = damage_type_name(tower->damage_type);
+            if (tower->damage_type == DAMAGE_TRUE) {
+                snprintf(log_buf, sizeof(log_buf),
+                         "干员#%d 对 敌人#%d 造成 %s伤害 %d (无视防御)",
+                         tower_idx, enemy_idx, type_name, actual_damage);
+            } else {
+                snprintf(log_buf, sizeof(log_buf),
+                         "干员#%d 对 敌人#%d 造成 %s伤害 %d -> %d (减伤 %d)",
+                         tower_idx, enemy_idx, type_name,
+                         tower->damage, actual_damage, reduced);
+            }
+            add_battle_log(game, log_buf);
+        }
+
         if (target->hp <= 0) {
             target->alive = false;
             game->gold += target->reward;
+            if (g_detailed_log) {
+                int enemy_idx = find_enemy_index(game, target);
+                char log_buf[128];
+                snprintf(log_buf, sizeof(log_buf),
+                         "敌人#%d 被击杀，获得 %d 费用",
+                         enemy_idx, target->reward);
+                add_battle_log(game, log_buf);
+            }
         }
     }
 }
@@ -749,10 +900,13 @@ static void print_help(void) {
     printf("  upgrade x y / 升级 x y    升级干员，最多 Lv.3\n");
     printf("  start / 开始              开始当前波次\n");
     printf("  map / 地图                显示地图\n");
+    printf("  log on/off / 日志 开/关   切换战斗详细日志\n");
     printf("  help / 帮助               显示帮助\n");
     printf("  tips / 提示               查看玩法提示\n");
     printf("  quit / 退出               退出游戏\n\n");
-    printf("说明：战斗阶段为自动战斗，无法输入指令；请在准备阶段完成部署和升级。\n\n");
+    printf("说明：战斗阶段为自动战斗，无法输入指令；请在准备阶段完成部署和升级。\n");
+    printf("伤害类型：1-2级干员为物理伤害，3级觉醒为法术伤害。\n");
+    printf("敌人有护甲和法抗，真实伤害无视防御。\n\n");
 }
 
 static bool starts_with_icase(const char *line, const char *prefix) {
@@ -799,6 +953,28 @@ static bool prep_phase(Game *game) {
             render_board(game, false);
             print_phase_hint(game);
             confirm_empty_start = false;
+        } else if (starts_with_icase(line, "log") || strncmp(line, "日志", strlen("日志")) == 0) {
+            bool log_en = starts_with_icase(line, "log");
+            bool turn_on = false;
+            bool turn_off = false;
+            if (log_en) {
+                turn_on = strstr(line, "on") != NULL;
+                turn_off = strstr(line, "off") != NULL;
+            } else {
+                turn_on = strstr(line, "开") != NULL;
+                turn_off = strstr(line, "关") != NULL;
+            }
+            if (turn_on) {
+                g_detailed_log = true;
+                printf("战斗详细日志已开启。\n");
+            } else if (turn_off) {
+                g_detailed_log = false;
+                printf("战斗详细日志已关闭。\n");
+            } else {
+                g_detailed_log = !g_detailed_log;
+                printf("战斗详细日志：%s\n", g_detailed_log ? "开启" : "关闭");
+            }
+            confirm_empty_start = false;
         } else if (starts_with_icase(line, "help") || strncmp(line, "帮助", strlen("帮助")) == 0) {
             print_help();
             confirm_empty_start = false;
@@ -825,6 +1001,15 @@ static bool prep_phase(Game *game) {
     }
 }
 
+static const char *difficulty_name(Difficulty diff) {
+    switch (diff) {
+        case DIFFICULTY_EASY: return "简单";
+        case DIFFICULTY_NORMAL: return "普通";
+        case DIFFICULTY_HARD: return "困难";
+        default: return "未知";
+    }
+}
+
 static bool run_wave(Game *game, const WaveConfig *cfg) {
     int spawned = 0;
     int tick = 0;
@@ -840,8 +1025,15 @@ static bool run_wave(Game *game, const WaveConfig *cfg) {
 
         clear_screen();
         render_board(game, true);
-        printf("第 %d 波 | 战斗轮次: %d\n", game->wave, tick);
+        printf("第 %d 波 | 战斗轮次: %d | 难度: %s | 日志: %s\n",
+               game->wave, tick,
+               difficulty_name(game->difficulty),
+               g_detailed_log ? "详细" : "简洁");
         printf("战斗提示：自动战斗中，敌人到达终点会扣基地生命，击杀敌人可获得费用。\n");
+        printf("本波敌人属性：生命 %d | 护甲 %d | 法抗 %d\n",
+               cfg->enemy_hp, cfg->armor, cfg->magic_resist);
+
+        print_battle_log(game);
 
         if (game->hp <= 0) {
             return false;
