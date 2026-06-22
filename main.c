@@ -50,6 +50,8 @@ typedef struct {
     int damage;
     int upgrade_cost;
     bool active;
+    bool promoted;
+    int promote_cost;
     DamageType damage_type;
 } Tower;
 
@@ -638,7 +640,13 @@ static void render_board(const Game *game, bool show_enemy_hp) {
         if (!game->towers[i].active) continue;
         int x = game->towers[i].x;
         int y = game->towers[i].y;
-        grid[y][x] = (game->towers[i].level >= 3) ? 'A' : 'T';
+        if (game->towers[i].promoted) {
+            grid[y][x] = 'S';
+        } else if (game->towers[i].level >= 3) {
+            grid[y][x] = 'A';
+        } else {
+            grid[y][x] = 'T';
+        }
     }
 
     for (int i = 0; i < MAX_ENEMIES; i++) {
@@ -650,7 +658,7 @@ static void render_board(const Game *game, bool show_enemy_hp) {
     printf("=== 明日方舟迷你塔防（C 版）===\n");
     printf("波次: %d/%d | 基地生命: %d | 费用: %d | 干员数: %d\n",
            game->wave, game->max_waves, game->hp, game->gold, tower_count(game));
-    printf("图例: # 路径, T 干员, A 高级干员, E 敌人\n\n");
+    printf("图例: # 路径, T 干员, A 高级干员, S 精英干员(真伤), E 敌人\n\n");
 
     printf("   ");
     for (int x = 0; x < GRID_W; x++) {
@@ -718,6 +726,8 @@ static bool add_tower(Game *game, int x, int y) {
         game->towers[i].range = 2;
         game->towers[i].damage = 3;
         game->towers[i].upgrade_cost = 10;
+        game->towers[i].promoted = false;
+        game->towers[i].promote_cost = 20;
         game->towers[i].damage_type = DAMAGE_PHYSICAL;
         game->gold -= cost;
         printf("部署成功：(%d,%d) [物理伤害]\n", x, y);
@@ -735,7 +745,7 @@ static bool upgrade_tower(Game *game, int x, int y) {
         return false;
     }
     if (tower->level >= 3) {
-        printf("已达到最高等级。\n");
+        printf("已达到最高等级，可尝试 专精 指令获得真实伤害。\n");
         return false;
     }
     if (game->gold < tower->upgrade_cost) {
@@ -753,6 +763,32 @@ static bool upgrade_tower(Game *game, int x, int y) {
     } else {
         printf("升级成功：(%d,%d) -> Lv.%d [%s伤害]\n", x, y, tower->level, damage_type_name(tower->damage_type));
     }
+    return true;
+}
+
+static bool promote_tower(Game *game, int x, int y) {
+    Tower *tower = find_tower(game, x, y);
+    if (tower == NULL) {
+        printf("该位置没有可专精的干员。\n");
+        return false;
+    }
+    if (tower->level < 3) {
+        printf("干员等级不足，需要达到 Lv.3 才能专精。\n");
+        return false;
+    }
+    if (tower->promoted) {
+        printf("该干员已经专精过了。\n");
+        return false;
+    }
+    if (game->gold < tower->promote_cost) {
+        printf("费用不足，专精需要 %d。\n", tower->promote_cost);
+        return false;
+    }
+    game->gold -= tower->promote_cost;
+    tower->promoted = true;
+    tower->damage_type = DAMAGE_TRUE;
+    tower->damage += 1;
+    printf("专精成功：(%d,%d) -> 精英干员 [真实伤害，无视防御]\n", x, y);
     return true;
 }
 
@@ -898,6 +934,7 @@ static void print_help(void) {
     printf("\n可用指令：\n");
     printf("  place x y / 部署 x y      在坐标部署干员 (费用 8)\n");
     printf("  upgrade x y / 升级 x y    升级干员，最多 Lv.3\n");
+    printf("  promote x y / 专精 x y    Lv.3后专精为真实伤害 (费用 20)\n");
     printf("  start / 开始              开始当前波次\n");
     printf("  map / 地图                显示地图\n");
     printf("  log on/off / 日志 开/关   切换战斗详细日志\n");
@@ -905,7 +942,7 @@ static void print_help(void) {
     printf("  tips / 提示               查看玩法提示\n");
     printf("  quit / 退出               退出游戏\n\n");
     printf("说明：战斗阶段为自动战斗，无法输入指令；请在准备阶段完成部署和升级。\n");
-    printf("伤害类型：1-2级干员为物理伤害，3级觉醒为法术伤害。\n");
+    printf("伤害类型：1-2级为物理伤害，3级觉醒为法术伤害，专精后为真实伤害。\n");
     printf("敌人有护甲和法抗，真实伤害无视防御。\n\n");
 }
 
@@ -932,6 +969,8 @@ static bool prep_phase(Game *game) {
         bool place_cn = strncmp(line, "部署", strlen("部署")) == 0;
         bool upgrade_en = starts_with_icase(line, "upgrade");
         bool upgrade_cn = strncmp(line, "升级", strlen("升级")) == 0;
+        bool promote_en = starts_with_icase(line, "promote");
+        bool promote_cn = strncmp(line, "专精", strlen("专精")) == 0;
 
         if (place_en || place_cn) {
             if ((place_en && sscanf(line, "%*s %d %d", &x, &y) == 2) ||
@@ -947,6 +986,14 @@ static bool prep_phase(Game *game) {
                 upgrade_tower(game, x, y);
             } else {
                 printf("格式错误：upgrade x y 或 升级 x y\n");
+            }
+            confirm_empty_start = false;
+        } else if (promote_en || promote_cn) {
+            if ((promote_en && sscanf(line, "%*s %d %d", &x, &y) == 2) ||
+                (promote_cn && sscanf(line, "专精 %d %d", &x, &y) == 2)) {
+                promote_tower(game, x, y);
+            } else {
+                printf("格式错误：promote x y 或 专精 x y\n");
             }
             confirm_empty_start = false;
         } else if (starts_with_icase(line, "map") || strncmp(line, "地图", strlen("地图")) == 0) {
